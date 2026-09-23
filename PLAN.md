@@ -131,22 +131,81 @@ implementa todo de golpe.
       consultar precio más barato).
 - [x] Filtro de `fail2ban` instalado y jail recargada (paso manual de Victor, completado).
 
-## Fase 3 — Workflow del ticket (la parte más compleja)
+## Fase 3 — Workflow del ticket (la parte más compleja) ✅ (2026-09-23)
 
-- [ ] Decidir cómo llega la imagen al workflow (base64 directo, file_id de la Files API de
-      Mistral, URL...)
-- [ ] Scaffolding del proyecto de Workflows (o reusar el de `mistral-workflow`/
-      `server-health-report` si se prefiere un único proyecto)
-- [ ] Activity: OCR del ticket (`mistralai_ocr`)
-- [ ] Activity: parseo + matching en un solo paso — texto OCR + contenido actual de
-      `lista_compra` → structured outputs con, por cada línea del ticket: producto,
-      supermercado, precio, `matched_item_id` (o null si es nuevo), y confianza del match
-- [ ] Activity: escribir cada línea en `historico_precios`
-- [ ] Activity: actualizar `último_precio` en `lista_compra` para los matches de confianza alta
-- [ ] Activity: eliminar de `lista_compra` los ítems de confianza alta ya comprados
-- [ ] Manejar los de confianza baja: no auto-aplicar, preguntar al usuario por chat antes de
-      tocar la base de datos
-- [ ] Probar con una foto de ticket real
+**Diseño simplificado (2026-09-23):** el Workflow NO toca SQLite directamente. Consulta y
+actualiza la lista de la compra llamando a las tools ya desplegadas en `lista.victorjdg.com`
+vía `execute_mcp_tool` — mismo patrón que `server_health.py` usó contra `mcp-server`. Esto
+elimina 3 de las "activities" que el plan original daba por hechas: `update_price` ya
+actualiza `lista_compra` **y** `historico_precios` en una transacción, y `remove_item` ya
+existe — ninguna de las dos es código nuevo, son llamadas MCP a tools ya probadas. Solo el
+OCR (ya oficial) y el parseo+matching son piezas nuevas de verdad.
+
+- [x] Decisión: reusar `~/mistral-workflow-project` (el que ya tiene `server-health-report`)
+      — nuevo fichero `src/workflows/shopping_receipt.py`, se auto-descubre solo. No se monta
+      un proyecto de Workflows dedicado aparte.
+- [x] Input del workflow: `ProcessReceiptInput.imagen_base64: str` — el **cómo llega la foto
+      desde el chat** sigue siendo la Fase 4, no esta.
+- [x] `MCPStreamableHTTPConfig` nuevo (`name="lista"`) apuntando a `lista.victorjdg.com`, env
+      vars `SHOPPING_LIST_MCP_URL`/`SHOPPING_LIST_MCP_TOKEN` (distintas de las que usa
+      `server_health.py` contra `mcp-server`, mismo `.env`).
+- [x] OCR (`mistralai_ocr`, `model="mistral-ocr-latest"`) y parseo+matching
+      (`chat_parse_to_model` — helper oficial que ya envuelve `mistralai_chat_parse` con
+      conversión de JSON Schema y validación, mejor que construirlo a mano) — **ninguno
+      envuelto en una activity propia**: ya son activities por sí mismas, envolverlas de
+      nuevo solo anidaría sin aportar nada (ver "Nested Activities" en la guía de referencia).
+  - Salida estructurada por línea del ticket: `producto`, `supermercado`, `precio`,
+    `en_lista_actual`, `confianza` ("alta"/"baja") — se cambió `matched_item_id` (numérico)
+    por reusar directamente el texto exacto de la lista, porque las tools `update_price`/
+    `remove_item` identifican por `(producto, supermercado)`, no por id, y `list_current` no
+    expone el id en su respuesta de texto.
+- [x] Confianza alta → `update_price` (siempre) + `remove_item` (solo si `en_lista_actual`).
+      Confianza baja → no se toca nada, se devuelve para revisión manual.
+- [x] **Verificado end-to-end** (2026-09-23) con un ticket sintético generado con Pillow
+      (texto plano, no una foto real) vía worker + `make execute`: OCR extrajo el texto
+      correctamente, el matching detectó una coincidencia real con ambigüedad genuina
+      (mismo producto de la lista real, `"Queso rayado"`, pero supermercado distinto al del
+      ticket de prueba) y lo dejó en confianza baja en vez de aplicarlo a ciegas — el diseño
+      de confianza funciona como red de seguridad de verdad, no solo sobre el papel.
+  - ⚠️ **Efecto secundario real detectado y corregido**: los otros 2 productos del ticket de
+    prueba (inventados, sin relación con la lista real) sí se escribieron en el
+    `historico_precios` de producción al no coincidir con nada — limpiado a mano tras la
+    prueba. **Lección para pruebas futuras de este workflow**: cualquier ejecución de prueba
+    contra el MCP server real escribe en la base de datos real, no hay entorno de pruebas
+    separado — revisar y limpiar después de cada prueba con datos inventados.
+- [x] **Probado con una foto de ticket real** (2026-09-23, ticket de Lidl con descuentos,
+      promociones y líneas con multiplicador de cantidad) — los 6 productos del ticket
+      calculados exactos, verificados a mano uno por uno.
+
+### Hallazgo real durante la prueba con el ticket de verdad: no delegar aritmética al LLM
+
+El ticket sintético (texto plano generado por mí) no tenía descuentos, así que no lo detectó.
+El ticket real de Lidl sí (`Desc.`, `Descuento 50%`, `PROMO 3X1,49€`, líneas con `4,49x2`), y
+el primer diseño (pedirle al modelo que devolviera ya el "precio unitario tras descuentos")
+falló: `PIZZA SALAMI PREMIUM` salió a **1.99€** en vez de los 1.79€ reales, y `BERLINA CHOCO`
+salió a 0.65€ ignorando la promo por completo — el modelo hizo mal la aritmética multi-paso
+(sumar varios descuentos, dividir entre cantidad) dentro del propio prompt.
+
+**Arreglo**: separar extracción de cálculo. El modelo ahora solo extrae `precio_bruto`,
+`descuentos` (lista de importes tal cual aparecen, sin sumarlos) y `cantidad` — el cálculo
+`(precio_bruto + sum(descuentos)) / cantidad` vive en Python
+(`TicketLine.precio_unitario`), determinista. Resultado tras el cambio: los 6 productos
+exactos, y como efecto colateral positivo **también se arregló la confianza baja
+generalizada** que salía en la primera versión (probablemente la incertidumbre del modelo
+sobre si había calculado bien contagiaba la confianza de todo el ticket, no solo de las
+líneas con descuento).
+
+**Lección para el futuro**: cuando se le pide a un LLM que extraiga datos estructurados de
+texto, mantener la aritmética fuera del prompt siempre que sea posible — pedir los números en
+crudo y calcular en código. No es la primera vez que aparece esta lección en el proyecto (ver
+también el aviso sobre `add_item`+precio no delegado a reglas de texto en la Fase 0), pero
+aquí se confirmó con datos reales el motivo concreto: los LLM fallan aritmética multi-paso de
+forma silenciosa, sin avisar del error.
+
+**Efecto secundario en datos reales, limpiado**: las pruebas de iteración del prompt escriben
+en el `historico_precios` de producción de verdad (no hay entorno de test separado) — quedaron
+3 filas con los precios incorrectos de la primera versión del prompt, identificadas y borradas
+tras confirmar con Victor. Las 6 filas correctas del ticket real de Lidl se quedaron.
 
 ## Fase 4 — Conectar Agent y Workflow
 
