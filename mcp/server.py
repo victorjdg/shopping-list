@@ -33,6 +33,14 @@ from mcp.server.fastmcp import FastMCP
 from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
+# Nota: importar mistralai.workflows.client (usado mas abajo, en process_receipt_photo)
+# imprime un log INFO ruidoso con la configuracion completa del SDK de Workflows (piensa
+# que puede arrancar un worker, aunque aqui solo se usa como cliente) -- esperado, no es
+# un error. Se ve una vez al arrancar el contenedor (import a nivel de modulo), no en
+# cada llamada a la tool.
+from mistralai.extra.workflows import WorkflowEncodingConfig, configure_workflow_encoding
+from mistralai.workflows.client import get_mistral_client
+
 # db/ vive un nivel por encima de mcp/ (../db desde este fichero), igual que en
 # local. En el contenedor: /app/mcp/server.py -> /app/db.
 DB_DIR = Path(__file__).resolve().parent.parent / "db"
@@ -63,6 +71,32 @@ if not MCP_AUTH_TOKEN.strip():
         "Debe contener un token secreto no vacío."
     )
 
+# Credenciales para disparar el Workflow "shopping-receipt" (Mistral Workflows) desde la
+# tool process_receipt_photo -- mismo patrón de validación temprana que MCP_AUTH_TOKEN.
+# WORKFLOWS_DEPLOYMENT_NAME debe coincidir con el worker real que registra ese workflow
+# (~/mistral-workflow-project en el servidor, ver Server/podman/mistral-workflow/README.md).
+try:
+    MISTRAL_API_KEY: str = os.environ["MISTRAL_API_KEY"]
+except KeyError as exc:
+    sys.stderr.write(
+        "ERROR FATAL: la variable de entorno MISTRAL_API_KEY es obligatoria (necesaria "
+        "para disparar el Workflow shopping-receipt desde process_receipt_photo).\n"
+    )
+    raise RuntimeError("Falta la variable de entorno obligatoria MISTRAL_API_KEY.") from exc
+
+try:
+    WORKFLOWS_DEPLOYMENT_NAME: str = os.environ["WORKFLOWS_DEPLOYMENT_NAME"]
+except KeyError as exc:
+    sys.stderr.write(
+        "ERROR FATAL: la variable de entorno WORKFLOWS_DEPLOYMENT_NAME es obligatoria "
+        "(nombre del deployment del worker que registra el workflow shopping-receipt).\n"
+    )
+    raise RuntimeError(
+        "Falta la variable de entorno obligatoria WORKFLOWS_DEPLOYMENT_NAME."
+    ) from exc
+
+WORKFLOWS_SERVER_URL = os.environ.get("WORKFLOWS_SERVER_URL", "https://api.mistral.ai")
+
 # Ruta del fichero SQLite. En el contenedor apunta al volumen /appdata (ver
 # 01-deploy.sh); si no se define, cae a la que db/ usa por defecto (útil para
 # pruebas en local sin contenedor).
@@ -85,7 +119,14 @@ mcp = FastMCP(
         "Lista de la compra compartida con histórico de precios por supermercado. "
         "Permite añadir y quitar productos de la lista, registrar precios "
         "observados y consultar dónde está más barato un producto ahora mismo "
-        "según el último precio conocido de cada supermercado."
+        "según el último precio conocido de cada supermercado.\n\n"
+        "IMPORTANTE sobre fotos de tickets de compra: si el usuario adjunta una foto de "
+        "un ticket, NO leas tú mismo los precios de la imagen ni llames a update_price "
+        "línea por línea -- aunque puedas ver la foto, los tickets con descuentos o "
+        "promociones necesitan un cálculo que un modelo no hace de forma fiable (se ha "
+        "verificado en pruebas reales: falla la aritmética de descuentos). Llama SIEMPRE "
+        "a process_receipt_photo pasándole la imagen en base64 y deja que ese proceso "
+        "haga el cálculo; no proceses el ticket por tu cuenta bajo ninguna circunstancia."
     ),
     host="0.0.0.0",
     port=8000,
@@ -171,6 +212,12 @@ def update_price(producto: str, supermercado: str, precio: float) -> str:
     Útil ante peticiones como "la leche en el Lidl está ahora a 1,10" o "he
     pagado el pan 0,95 en el Mercadona".
 
+    NO uses esta tool para procesar una foto de un ticket de compra, ni siquiera si
+    puedes ver los precios en la imagen -- usa process_receipt_photo en su lugar,
+    que calcula bien los descuentos y promociones (un modelo leyendo el ticket a
+    ojo falla esa aritmética). Esta tool es solo para un precio suelto que el
+    usuario menciona por texto.
+
     Args:
         producto: nombre del producto (p. ej. "leche entera").
         supermercado: supermercado donde se ha visto el precio.
@@ -248,6 +295,45 @@ def list_current() -> str:
                 f"{item['ultimo_precio']:.2f} € (actualizado {item['actualizado_en']})"
             )
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def process_receipt_photo(imagen_base64: str) -> str:
+    """Procesa la foto de un ticket de compra: hace OCR, identifica los productos y sus
+    precios reales (ya con descuentos aplicados), y actualiza la lista de la compra --
+    registra el precio en el histórico y quita de la lista los productos que ya estaban
+    en ella. Los productos con alguna ambigüedad genuina (letra poco clara del OCR,
+    varias coincidencias posibles en la lista, etc.) NO se tocan automáticamente: se
+    devuelven aparte para que el usuario los revise a mano.
+
+    Dispara el Workflow "shopping-receipt" (Mistral Workflows) y espera su resultado --
+    puede tardar unos segundos (hace OCR y una llamada al modelo antes de responder).
+
+    Útil ante peticiones como "he subido la foto del ticket, procésalo" cuando el usuario
+    adjunta una foto de un ticket de supermercado en la conversación.
+
+    ES LA ÚNICA FORMA CORRECTA de procesar un ticket, aunque puedas ver la imagen tú
+    mismo: NO leas los precios de la foto y los registres a mano con update_price --
+    un modelo leyendo un ticket a ojo falla la aritmética de descuentos y promociones
+    (verificado en pruebas reales). Pásale siempre la imagen a esta tool y deja que
+    calcule ella los precios finales.
+
+    Args:
+        imagen_base64: contenido de la foto del ticket codificado en base64 (solo los
+            bytes de la imagen, sin el prefijo "data:image/...;base64,").
+    """
+    try:
+        client = get_mistral_client(api_key=MISTRAL_API_KEY, server_url=WORKFLOWS_SERVER_URL)
+        await configure_workflow_encoding(WorkflowEncodingConfig(), client=client)
+        result = await client.workflows.execute_workflow_and_wait_async(
+            workflow_identifier="shopping-receipt",
+            input={"imagen_base64": imagen_base64},
+            deployment_name=WORKFLOWS_DEPLOYMENT_NAME,
+        )
+    except Exception as exc:  # noqa: BLE001 - mensaje legible, no stacktrace
+        return f"Error al procesar el ticket: {exc}"
+
+    return str(result)
 
 
 # ---------------------------------------------------------------------------

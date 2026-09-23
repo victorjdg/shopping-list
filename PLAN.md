@@ -207,14 +207,49 @@ en el `historico_precios` de producción de verdad (no hay entorno de test separ
 3 filas con los precios incorrectos de la primera versión del prompt, identificadas y borradas
 tras confirmar con Victor. Las 6 filas correctas del ticket real de Lidl se quedaron.
 
-## Fase 4 — Conectar Agent y Workflow
+## Fase 4 — Conectar Agent y Workflow ✅ (2026-09-23, con una limitación real aceptada)
 
-- [ ] Mirar `durable-agents.mdx` (en la documentación de referencia que trae el scaffolding de
-      Mistral Workflows) para ver si cubre este patrón de forma nativa
-- [ ] Añadir al Agent conversacional una tool `process_receipt_photo(imagen)` que dispare la
-      ejecución del Workflow
-- [ ] Probar el flujo completo desde el chat: subir una foto → confirmar que se actualizan
-      lista y histórico correctamente
+- [x] Mirado `durable-agents.mdx` — cubre un patrón de Agent conversacional embebido en un
+      Workflow (`Agent`/`Runner`/`Session`), pero se descartó para esto: habría sustituido el
+      Connector de Mistral Studio que ya funcionaba (Fase 2) por algo sin interfaz de chat
+      clara, a cambio de nada — más complejidad sin beneficio real para este caso.
+- [x] Añadida `process_receipt_photo(imagen_base64)` al MCP server de `lista.victorjdg.com` —
+      dispara el Workflow `shopping-receipt` vía `client.workflows.execute_workflow_and_wait_async`
+      (SDK `mistralai-workflows[mistralai]`, mismo mecanismo que `make execute`). Necesitó
+      `MISTRAL_API_KEY` y `WORKFLOWS_DEPLOYMENT_NAME` nuevos en el MCP server (antes no
+      necesitaba ninguna credencial de Mistral, solo servía datos).
+- [x] **Probado en vivo con la foto real de Lidl (dos veces) — la tool nunca se llegó a
+      invocar.** En ambas pruebas, cero actividad en el worker (sin `mistralai_ocr`, sin
+      `execute_mcp_tool`) pese a que el resultado en el chat parecía correcto: Le Chat, al ver
+      la foto adjunta (es multimodal), la procesó **con su propia visión** y llamó él mismo a
+      `update_price` línea por línea, saltándose la tool nueva por completo.
+  - **Causa raíz, no es un problema de prompting**: un modelo que "ve" una imagen vía su
+    encoder de visión no tiene acceso a los bytes crudos del fichero — no puede reproducir un
+    base64 válido de esa imagen como argumento de texto de una tool call. No es que ignore la
+    instrucción, es que la vía diseñada (pasar la imagen como string en un argumento MCP) no es
+    técnicamente viable para un LLM multimodal. Reforzar las descripciones de las tools
+    (`instructions` del servidor MCP + docstrings de `update_price`/`process_receipt_photo`,
+    ambas versiones desplegadas y probadas) no lo arregló — confirma que es estructural, no de
+    redacción.
+  - **Efecto real**: al procesar el ticket con su propia visión, el modelo **no calcula bien
+    los descuentos** — mismo fallo de aritmética que motivó todo el rediseño de la Fase 3, pero
+    esta vez sin la protección de `TicketLine.precio_unitario` porque el Workflow ni se
+    ejecuta. Verificado en las dos pruebas: Pizza Salami Premium y Pizza Sobrasada Miel
+    quedaron en el histórico a 4.49€/3.99€ (precio de catálogo) en vez de 1.79€/1.59€ (precio
+    real con descuento) — los productos sin descuento sí salieron bien, por pura coincidencia.
+  - **Alternativa propuesta y descartada por Victor**: un endpoint HTTP propio (fuera del
+    chat) donde subir la foto directamente y disparar el Workflow con los bytes reales, sin
+    pasar por el modelo. Victor prefirió mantener todo dentro del chat de Mistral aunque eso
+    signifique aceptar la limitación de precisión en tickets con descuento.
+  - **Decisión final de Victor**: aceptar el comportamiento actual tal cual. El chat procesa
+    tickets end-to-end (ve la foto, actualiza lista e histórico), con la advertencia de que
+    **los precios con descuento/promoción pueden quedar mal** en el histórico — a revisar a
+    mano si hace falta precisión ahí. `process_receipt_photo` y el Workflow `shopping-receipt`
+    se quedan desplegados (no hacen daño) pero no los usa el flujo real por chat.
+- [x] Limpiadas del histórico real las filas de prueba erróneas de la primera prueba (12
+      filas, ids 11-22 de esa sesión) tras confirmar con Victor; las de la segunda prueba (ids
+      15-16, Pizza Salami Premium/Sobrasada Miel a precio sin descontar) se dejaron tal cual a
+      petición explícita de Victor, como ejemplo real de esta limitación conocida.
 
 ## Fase 5 — Despliegue y robustez
 

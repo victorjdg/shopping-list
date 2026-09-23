@@ -6,3 +6,10 @@ mcp>=1.30.0,<2
 # Servidor ASGI usado para levantar la app manualmente (envuelta en el
 # middleware de autenticación) en 0.0.0.0:8000.
 uvicorn>=0.31.1
+
+# Cliente de Mistral Workflows, usado solo por process_receipt_photo para disparar el
+# Workflow "shopping-receipt" (get_mistral_client, execute_workflow_and_wait_async) y
+# esperar su resultado. Trae temporalio como dependencia transitiva (el mismo paquete
+# sirve para escribir workers, aunque aqui solo se usa como cliente) -- no hay una
+# variante mas ligera documentada solo-cliente, ver PLAN.md (Fase 4) para el detalle.
+mistralai-workflows[mistralai]>=3.0.0,<4

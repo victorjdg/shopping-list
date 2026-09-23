@@ -30,6 +30,7 @@ podman run -d --name "$CONTAINER_NAME" --replace \
   --restart=always \
   --env-file ./secrets/mcp-token.env \
   -e SHOPPING_LIST_DB="$SHOPPING_LIST_DB" \
+  -e WORKFLOWS_DEPLOYMENT_NAME="$WORKFLOWS_DEPLOYMENT_NAME" \
   -p "127.0.0.1:$PORT:8000" \
   -v "$APPDATA_ROOT":/appdata \
   "$IMAGE_NAME"
