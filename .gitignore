@@ -4,7 +4,7 @@ secrets/*.env
 __pycache__/
 *.pyc
 
-# Ficheros SQLite locales (dev/tests) -- en produccion vive en el volumen appdata del
-# contenedor, fuera del repo.
+# Local SQLite files (dev/tests) -- in production it lives on the container's appdata
+# volume, outside the repo.
 *.sqlite
 *.sqlite3

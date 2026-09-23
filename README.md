@@ -1,92 +1,84 @@
-# Lista de la compra + histórico de precios (vía Mistral AI)
+# Shopping List MCP + Workflow
 
-Lista de la compra personal con histórico de precios por supermercado, controlable por
-lenguaje natural desde el chat de Mistral (Le Chat), con procesado de fotos de tickets como
-funcionalidad adicional. Proyecto de aprendizaje sobre Mistral Workflows/Agents, self-hosted en
-`vserver` (ver [`Server/CLAUDE.md`](https://github.com/victorjdg/vserver) para la topología del
-servidor).
+A personal shopping list with price history per supermarket, controllable entirely by natural
+language through an LLM (I use it from Mistral AI's Le Chat), plus a Mistral Workflow that
+processes a photo of a receipt: OCR, matches each line against the current list, and computes
+the real price after discounts.
 
-Ver [`PLAN.md`](./PLAN.md) para el historial completo de decisiones, hallazgos y fases — este
-README es solo el resumen de qué es y cómo se despliega.
+It's built as a **[Model Context Protocol](https://modelcontextprotocol.io) server** — the LLM
+never touches the database directly, it only calls tools and gets a text result back.
 
-## Qué hace
+## ⚠️ A known limitation
 
-- **Conversacional** (`add_item`, `remove_item`, `update_price`, `query_cheapest`,
-  `list_current`): añadir/quitar productos, registrar precios observados y consultar dónde está
-  más barato algo ahora mismo, todo por chat.
-- **Procesado de tickets** (`process_receipt_photo`): sube una foto de un ticket y, en teoría,
-  hace OCR + calcula los precios reales con descuentos aplicados + actualiza la lista y el
-  histórico. **Con una limitación real e importante, ver más abajo.**
+The receipt-photo tool (`process_receipt_photo`) exists and works when called directly, but in
+practice a chat client with vision (like Mistral's Le Chat) sees an attached photo and processes
+it **with its own vision** instead of calling the tool — it turns out a model can't reliably
+reproduce the real bytes of an image it only "sees" as a valid base64 tool-call argument. The
+practical effect: receipts with discounts or multi-buy promotions can end up in the price
+history at catalog price instead of the real discounted price, because the model does the
+arithmetic itself instead of going through the Workflow. Documented here rather than papered
+over — a good reminder that "the model can see it" and "the model can pass it to a tool" aren't
+the same thing.
 
-## ⚠️ Limitación conocida: el procesado de tickets no pasa por el Workflow en la práctica
-
-`process_receipt_photo` dispara un Workflow (`shopping-receipt`) que hace OCR y calcula bien los
-descuentos/promociones (verificado con un ticket real). Pero **Le Chat, al ver una foto
-adjunta, la procesa con su propia visión y llama directamente a `update_price` línea por línea,
-sin pasar por la tool** — no es un problema de instrucciones (se reforzaron las descripciones de
-las tools y siguió pasando dos veces seguidas): un modelo que "ve" una imagen no tiene acceso a
-sus bytes crudos, así que no puede reproducir un base64 válido como argumento de una tool call.
-
-**Efecto real**: los tickets con descuentos/promociones pueden quedar en el histórico con el
-precio de catálogo, no el precio real pagado — revisar a mano si hace falta precisión. Detalle
-completo y la alternativa que se descartó (endpoint HTTP propio fuera del chat) en la sección
-Fase 4 de `PLAN.md`.
-
-## Arquitectura
+## Architecture
 
 ```
-Le Chat (Mistral) ── Connector MCP ──► lista.victorjdg.com (mcp/, este repo)
-                                              │
-                                              ├─ 5 tools CRUD/consulta → db/ (SQLite)
-                                              │
-                                              └─ process_receipt_photo
-                                                     │ dispara (SDK Mistral Workflows)
-                                                     ▼
-                                        mistral-workflow-worker (Server/podman/mistral-workflow/)
-                                              │  workflow "shopping-receipt"
-                                              │  (OCR + cálculo de descuentos + llama de
-                                              │   vuelta a lista.victorjdg.com por MCP)
-                                              ▼
-                                        db/ (SQLite, /mnt/storage/appdata/shopping-list)
+LLM chat client ── MCP (Streamable HTTP, Bearer auth) ──► mcp/server.py
+                                                                │
+                                                                ├─ 5 tools ──► db/ (SQLite)
+                                                                │
+                                                                └─ process_receipt_photo
+                                                                       │ triggers (Mistral
+                                                                       │ Workflows SDK)
+                                                                       ▼
+                                                        Workflow: OCR + discount math
+                                                        + calls back into the 5 tools above
 ```
 
-El worker de Mistral Workflows es **infraestructura compartida** con otro proyecto
-(`server-health-report`, un informe diario del estado del servidor) — vive y se despliega desde
-el repo `Server` (`podman/mistral-workflow/`), no desde aquí. Este repo mantiene su propia copia
-versionada de `workflow/shopping_receipt.py`; si se edita, replicar el cambio en las dos copias
-(ver comentario en el fichero).
+The Workflow needs a Mistral Workflows **worker** process running somewhere to actually execute
+(not included in this repo — it's a small piece of shared infrastructure, see
+`workflow/README.md`). Everything else here is self-contained.
 
-## Estructura del repo
+## Tools
 
-| Directorio | Qué es | Despliegue |
-|---|---|---|
-| `db/` | Schema SQLite + capa de acceso (`db.py`, `initdb.py`) | Se importa tal cual desde `mcp/` |
-| `mcp/` | Servidor MCP (`server.py`), expone las 6 tools | `01-deploy.sh` → contenedor `shopping-list`, `https://lista.victorjdg.com` |
-| `workflow/` | `shopping_receipt.py` — copia versionada, el worker real vive en `Server/podman/mistral-workflow/` | Ver ese repo |
-| `backup/` | `backup.py` — backup diario del SQLite vía cron | `backup/README.md` |
-| `secrets/` | Tokens/credenciales, no versionado (`.gitignore`) | — |
-| `PLAN.md` | Historial completo de decisiones y hallazgos por fase | — |
+| Tool | What it does |
+|---|---|
+| `add_item(producto, supermercado, precio?)` | Adds a product to the list. Upserts on `(producto, supermercado)` — doesn't duplicate if it's already there. The optional price is stored only as the list's "last known price," **not** logged to price history (use `update_price` for that). |
+| `remove_item(producto, supermercado)` | Removes a product from the list. Price history is untouched — a removed product still answers `query_cheapest`. |
+| `update_price(producto, supermercado, precio)` | Logs an observed price: updates the list's last-known price *and* appends a row to price history, atomically. The right tool whenever a real price was just seen, whether or not the product is currently on the list. |
+| `query_cheapest(producto)` | Returns the most recent known price at each supermarket for a product, cheapest first — not the historical minimum, the latest one. |
+| `list_current()` | Shows everything currently on the list, with last known price and when it was last updated. |
+| `process_receipt_photo(imagen_base64)` | Triggers the `shopping-receipt` Mistral Workflow: OCRs the photo, matches each line item against the current list, computes the real per-unit price after discounts in code (never trusting an LLM with that arithmetic — verified that it silently gets it wrong), and applies high-confidence matches automatically. See the limitation above. |
 
-## Desplegar desde cero
+## Repo layout
+
+| Directory | What's in it |
+|---|---|
+| `db/` | SQLite schema + access layer (`db.py`, `initdb.py`) |
+| `mcp/` | The MCP server (`server.py`) — the 6 tools above |
+| `workflow/` | `shopping_receipt.py`, the Mistral Workflow definition |
+| `backup/` | Daily SQLite backup script (`sqlite3.Connection.backup()` + rotation) |
+| `secrets/` | Tokens, `.gitignore`'d — see `secrets/*.env.example` |
+
+## Deploying
 
 ```bash
-# 1. MCP server (lista.victorjdg.com)
-cp secrets/mcp-token.env.example secrets/mcp-token.env   # rellenar MCP_AUTH_TOKEN y MISTRAL_API_KEY
+cp secrets/mcp-token.env.example secrets/mcp-token.env
+# fill in MCP_AUTH_TOKEN (random token clients authenticate with) and MISTRAL_API_KEY
 ./01-deploy.sh
-
-# 2. Worker de Mistral Workflows (compartido, ver Server/podman/mistral-workflow/README.md)
-
-# 3. Backups (ver backup/README.md)
 ```
 
-Falta aparte (vive en el repo `Server`, no aquí): bloque del Caddyfile para
-`lista.victorjdg.com` y jail de `fail2ban` — ver `Server/CLAUDE.md`, sección "Lista de la
-compra vía Mistral".
+Builds a container from `mcp/Dockerfile` (context: repo root, since it imports `db/` as-is),
+publishes on loopback only, and expects a reverse proxy with HTTPS in front for real use. See
+`config.env` for the volume/port layout, and `backup/README.md` for the backup cron job.
 
-## Registrar el Connector en Mistral Studio
+## Registering as an MCP Connector (Mistral Studio)
 
-Mismos pasos que `mcp-server` — ver
-[`Server/podman/mcp-server/REGISTRO-MISTRAL.md`](https://github.com/victorjdg/vserver/blob/main/podman/mcp-server/REGISTRO-MISTRAL.md),
-sustituyendo la URL por `https://lista.victorjdg.com/mcp`. **Ojo con el prefijo `Bearer`**: el
-campo de valor de la cabecera en Mistral Studio no lo añade solo, hay que escribirlo a mano
-(`Bearer <token>`) — ver esa misma guía.
+1. Studio → **Connectors** → new Connector.
+2. Server URL: your deployed `/mcp` endpoint.
+3. Headers → `Authorization` → `Bearer <your MCP_AUTH_TOKEN>`.
+
+**Gotcha**: the header *value* field in Mistral Studio does not prepend `Bearer` for you — type
+the literal string `Bearer <token>` (with the space), not just the token. Confirmed live: Studio
+was sending the bare 48-character token instead of the 55-character `Bearer <token>`, causing
+every call to 401 until fixed.

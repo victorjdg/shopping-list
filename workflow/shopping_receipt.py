@@ -1,14 +1,19 @@
-"""Procesa la foto de un ticket de compra: OCR + matching contra la lista actual (mismo MCP
-server de shopping-list, via execute_mcp_tool) + registro de precios + limpieza de la lista.
-Ver shopping-list/PLAN.md (Fase 3) para el diseno completo.
+"""Processes a photo of a shopping receipt: OCR + matching against the current list (the
+same shopping-list MCP server, via execute_mcp_tool) + price logging + list cleanup.
 
-No toca SQLite directamente -- llama a las tools ya desplegadas en lista.victorjdg.com
-(list_current, update_price, remove_item), mismo patron que server_health.py contra
-mcp-server. Las unicas piezas de logica nueva son el OCR y el parseo+matching con salida
-estructurada -- ambos delegan en activities oficiales del plugin
-(mistralai_ocr, chat_parse_to_model sobre mistralai_chat_parse), sin envolverlas en activities
-propias: igual que execute_mcp_tool, ya son activities por si mismas, envolverlas de nuevo solo
-anidaria sin aportar nada (ver "Nested Activities" en la guia de referencia del scaffolding).
+Doesn't touch SQLite directly -- calls the tools already deployed on the shopping-list MCP
+server (list_current, update_price, remove_item), same pattern as any other workflow that
+talks to an MCP server via execute_mcp_tool. The only genuinely new pieces of logic are OCR
+and the structured-output parsing+matching -- both delegate to official activities of the
+plugin (mistralai_ocr, chat_parse_to_model over mistralai_chat_parse), without wrapping them
+in activities of their own: like execute_mcp_tool, they're already activities by themselves,
+wrapping them again would only nest without adding anything (see "Nested Activities" in the
+Mistral Workflows reference docs).
+
+Note: the model prompt below is in Spanish on purpose -- it processes real Spanish
+supermarket receipts and a shopping list with Spanish product/supermarket names, and keeping
+the instruction language aligned with the data it reads and writes avoids adding a second,
+unnecessary translation step for the model.
 """
 
 import os
@@ -20,10 +25,9 @@ from mistralai.client.models.imageurlchunk import ImageURLChunk
 from mistralai.workflows.plugins.mistralai.mcp import ExecuteMCPToolParams
 from pydantic import BaseModel
 
-# Config del cliente MCP contra el servidor de la lista de la compra (repo shopping-list,
-# desplegado en lista.victorjdg.com) -- mismo patron que _MCP_CONFIG en server_health.py, pero
-# apuntando a otro servidor. Nombres de env var DISTINTOS de los que usa server_health.py
-# contra mcp-server, para no chocar en el mismo .env.
+# Config for the MCP client against the shopping-list server -- same pattern as any other
+# MCP client config, just pointing at a different server. Env var names are DISTINCT from
+# any other MCP client config in the same worker, so they don't collide in the same .env.
 _SHOPPING_MCP_CONFIG = workflows_mistralai.MCPStreamableHTTPConfig(
     name="lista",
     url=os.environ.get("SHOPPING_LIST_MCP_URL", "http://host.containers.internal:8001/mcp"),
@@ -32,8 +36,8 @@ _SHOPPING_MCP_CONFIG = workflows_mistralai.MCPStreamableHTTPConfig(
 
 
 async def _call_shopping_tool(tool_name: str, arguments: dict) -> str:
-    """Llama a una tool del MCP server de la lista de la compra. Mismo wrapper fino que
-    _call_tool en server_health.py, apuntando a otro config."""
+    """Calls a tool on the shopping-list MCP server. A thin wrapper around
+    execute_mcp_tool, pointed at the config above."""
     result = await workflows_mistralai.execute_mcp_tool(
         ExecuteMCPToolParams(
             configs=[_SHOPPING_MCP_CONFIG],
@@ -46,8 +50,8 @@ async def _call_shopping_tool(tool_name: str, arguments: dict) -> str:
 
 
 async def _ocr_ticket(imagen_base64: str) -> str:
-    """OCR del ticket via mistral-ocr-latest. Devuelve el markdown de todas las paginas
-    concatenado (un ticket normal es 1 pagina, pero por si acaso)."""
+    """OCRs the receipt via mistral-ocr-latest. Returns the markdown of every page
+    concatenated (a normal receipt is 1 page, but just in case)."""
     response = await workflows_mistralai.mistralai_ocr(
         workflows_mistralai.OCRRequest(
             model="mistral-ocr-latest",
@@ -68,11 +72,11 @@ class TicketLine(BaseModel):
 
     @property
     def precio_unitario(self) -> float:
-        """Precio unitario REAL pagado -- calculado en Python, no por el modelo. Pedirle a un
-        LLM que sume descuentos y divida entre cantidad dentro del propio prompt es fragil (se
-        verifico en vivo con un ticket real: el modelo fallaba la aritmetica en mas de una
-        linea). El modelo solo extrae los numeros en crudo del ticket; el calculo determinista
-        vive aqui."""
+        """REAL unit price paid -- computed in Python, not by the model. Asking an LLM
+        to sum discounts and divide by quantity inline in the prompt is fragile (verified
+        live with a real receipt: the model got the arithmetic wrong on more than one
+        line). The model only extracts the raw numbers from the receipt; the
+        deterministic calculation lives here."""
         cantidad = max(self.cantidad, 1)
         return round((self.precio_bruto + sum(self.descuentos)) / cantidad, 2)
 
@@ -82,13 +86,14 @@ class TicketMatches(BaseModel):
 
 
 async def _parse_ticket(texto_ocr: str, lista_actual: str) -> TicketMatches:
-    """Convierte el texto OCR del ticket en lineas estructuradas, decidiendo por cada una si
-    coincide con algo que ya estaba en la lista actual -- delegado al modelo (ver PLAN.md,
-    Fase 0: "como se identifica el mismo producto"), no a reglas de texto.
+    """Turns the receipt's OCR text into structured lines, deciding for each one
+    whether it matches something already on the current list -- delegated to the model
+    (identifying "the same product" from free text is ambiguous, no fixed rule covers
+    it), not to text rules.
 
-    El modelo solo EXTRAE numeros del texto (precio_bruto, descuentos, cantidad) -- no hace
-    ninguna suma/resta/division. El calculo del precio unitario final vive en
-    TicketLine.precio_unitario, en Python."""
+    The model only EXTRACTS numbers from the text (precio_bruto, descuentos, cantidad)
+    -- it does no addition/subtraction/division. The final unit price calculation lives
+    in TicketLine.precio_unitario, in Python."""
     prompt = (
         "Eres un asistente que extrae productos y precios de un ticket de supermercado ya "
         "pasado por OCR, y los compara con la lista de la compra actual del usuario.\n\n"
@@ -130,10 +135,10 @@ class ProcessReceiptInput(BaseModel):
 
 @workflows.workflow.define(
     name="shopping-receipt",
-    workflow_display_name="Procesar ticket de compra",
+    workflow_display_name="Process shopping receipt",
     workflow_description=(
-        "OCR de una foto de ticket, matching contra la lista de la compra actual, registro "
-        "de precios en el historico y limpieza de los productos ya comprados."
+        "OCR of a receipt photo, matching against the current shopping list, logging "
+        "prices to history, and cleaning up products already bought."
     ),
 )
 class ProcessReceiptWorkflow:
@@ -146,7 +151,7 @@ class ProcessReceiptWorkflow:
         aplicados = []
         revisar = []
         for linea in matches.lineas:
-            precio = linea.precio_unitario  # calculado en Python, ver TicketLine.precio_unitario
+            precio = linea.precio_unitario  # computed in Python, see TicketLine.precio_unitario
             if linea.confianza == "alta":
                 await _call_shopping_tool(
                     "update_price",
@@ -161,16 +166,16 @@ class ProcessReceiptWorkflow:
                         "remove_item",
                         {"producto": linea.producto, "supermercado": linea.supermercado},
                     )
-                aplicados.append(f"{linea.producto} ({linea.supermercado}): {precio:.2f} €")
+                aplicados.append(f"{linea.producto} ({linea.supermercado}): {precio:.2f} EUR")
             else:
-                revisar.append(f"{linea.producto} ({linea.supermercado}): {precio:.2f} €")
+                revisar.append(f"{linea.producto} ({linea.supermercado}): {precio:.2f} EUR")
 
         partes = []
         if aplicados:
-            partes.append("Aplicado automáticamente:\n" + "\n".join(f"- {a}" for a in aplicados))
+            partes.append("Applied automatically:\n" + "\n".join(f"- {a}" for a in aplicados))
         if revisar:
             partes.append(
-                "Revisar a mano (confianza baja, no se ha tocado la lista):\n"
+                "Needs manual review (low confidence, list untouched):\n"
                 + "\n".join(f"- {r}" for r in revisar)
             )
-        return "\n\n".join(partes) if partes else "No se detectó ningún producto en el ticket."
+        return "\n\n".join(partes) if partes else "No product was detected on the receipt."

@@ -1,9 +1,9 @@
-"""Pruebas de las funciones de db/db.py.
+"""Tests for the functions in db/db.py.
 
-Cada test trabaja sobre una base de datos temporal nueva, parcheando
-db.DB_PATH, para no tocar nunca el shopping_list.sqlite real.
+Each test runs against a fresh temporary database, patching db.DB_PATH, so
+the real shopping_list.sqlite is never touched.
 
-Ejecutar:  python3 test_db.py   (o   python3 test_db.py -v   para mas detalle)
+Run:  python3 test_db.py   (or   python3 test_db.py -v   for more detail)
 """
 
 import sqlite3
@@ -37,14 +37,14 @@ class DbTestCase(unittest.TestCase):
 
 
 class TestConnect(DbTestCase):
-    def test_la_conexion_se_cierra_al_salir_del_with(self):
+    def test_connection_closes_on_exiting_with(self):
         with db._connect() as conn:
             conn.execute("SELECT 1")
-        # si no se hubiera cerrado deterministamente, esto funcionaria
+        # if it hadn't closed deterministically, this would work
         with self.assertRaises(sqlite3.ProgrammingError):
             conn.execute("SELECT 1")
 
-    def test_el_with_sigue_haciendo_commit(self):
+    def test_with_still_commits(self):
         db.add_item("Leche", "Lidl", 1.05)
         self.assertEqual(
             self.query_one("SELECT COUNT(*) FROM lista_compra")[0], 1
@@ -52,32 +52,32 @@ class TestConnect(DbTestCase):
 
 
 class TestAddItem(DbTestCase):
-    def test_inserta_items_distintos(self):
+    def test_inserts_distinct_items(self):
         db.add_item("Leche", "Mercadona", 1.20)
         db.add_item("Leche", "Lidl", 1.05)
         self.assertEqual(len(db.list_current()), 2)
 
-    def test_upsert_misma_pareja_no_duplica_y_actualiza_precio(self):
+    def test_upsert_same_pair_does_not_duplicate_and_updates_price(self):
         db.add_item("Leche", "Mercadona", 1.20)
         db.add_item("Leche", "Mercadona", 1.25)
         items = db.list_current()
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["ultimo_precio"], 1.25)
 
-    def test_precio_none_queda_sin_precio(self):
+    def test_none_price_stays_without_a_price(self):
         db.add_item("Pan", "Lidl", None)
         self.assertIsNone(db.list_current()[0]["ultimo_precio"])
 
 
 class TestRemoveItem(DbTestCase):
-    def test_devuelve_true_si_existia(self):
+    def test_returns_true_if_it_existed(self):
         db.add_item("Pan", "Mercadona", 0.95)
         self.assertTrue(db.remove_item("Pan", "Mercadona"))
 
-    def test_devuelve_false_si_no_existia(self):
+    def test_returns_false_if_it_did_not_exist(self):
         self.assertFalse(db.remove_item("Pan", "Mercadona"))
 
-    def test_no_borra_el_historico(self):
+    def test_does_not_delete_price_history(self):
         db.add_item("Pan", "Mercadona", 0.95)
         db.update_price("Pan", "Mercadona", 0.90)
         db.remove_item("Pan", "Mercadona")
@@ -87,7 +87,7 @@ class TestRemoveItem(DbTestCase):
 
 
 class TestUpdatePrice(DbTestCase):
-    def test_actualiza_lista_y_anade_historico(self):
+    def test_updates_list_and_appends_to_history(self):
         db.add_item("Leche", "Lidl", 1.05)
         db.update_price("Leche", "Lidl", 1.10)
         fila_lista = self.query_one(
@@ -101,9 +101,9 @@ class TestUpdatePrice(DbTestCase):
         self.assertEqual(fila_lista[0], 1.10)
         self.assertEqual(fila_hist[0], 1.10)
 
-    def test_transaccion_atomica_si_falla_el_historico_no_se_actualiza_la_lista(self):
+    def test_atomic_transaction_if_history_fails_list_is_not_updated(self):
         db.add_item("Leche", "Lidl", 1.05)
-        # Trigger que aborta cualquier INSERT en historico_precios
+        # Trigger that aborts any INSERT into historico_precios
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 """
@@ -116,14 +116,14 @@ class TestUpdatePrice(DbTestCase):
             )
         with self.assertRaises(sqlite3.IntegrityError):
             db.update_price("Leche", "Lidl", 1.10)
-        # El UPDATE de lista_compra se deshace: sigue el precio anterior
+        # The lista_compra UPDATE gets rolled back: the previous price remains
         fila_lista = self.query_one(
             "SELECT ultimo_precio FROM lista_compra WHERE producto = ? AND supermercado = ?",
             ("Leche", "Lidl"),
         )
         self.assertEqual(fila_lista[0], 1.05)
 
-    def test_producto_fuera_de_lista_solo_queda_en_historico(self):
+    def test_product_not_on_list_only_ends_up_in_history(self):
         db.update_price("Cafe", "Lidl", 3.00)
         self.assertEqual(len(db.list_current()), 0)
         self.assertEqual(
@@ -132,15 +132,15 @@ class TestUpdatePrice(DbTestCase):
 
 
 class TestQueryCheapest(DbTestCase):
-    def test_precio_reciente_por_supermercado_no_el_minimo_historico(self):
+    def test_recent_price_per_supermarket_not_the_historical_minimum(self):
         db.update_price("Leche", "Lidl", 1.15)
-        db.update_price("Leche", "Lidl", 1.10)   # sube de nuevo: gana el reciente
+        db.update_price("Leche", "Lidl", 1.10)   # goes back up: the recent one wins
         db.update_price("Leche", "Mercadona", 1.30)
         self.assertEqual(
             db.query_cheapest("Leche"), [("Lidl", 1.10), ("Mercadona", 1.30)]
         )
 
-    def test_ordenado_de_mas_barato_a_mas_caro(self):
+    def test_sorted_cheapest_to_most_expensive(self):
         db.update_price("Leche", "Mercadona", 1.30)
         db.update_price("Leche", "Lidl", 1.10)
         db.update_price("Leche", "Carrefour", 1.20)
@@ -149,20 +149,20 @@ class TestQueryCheapest(DbTestCase):
             [("Lidl", 1.10), ("Carrefour", 1.20), ("Mercadona", 1.30)],
         )
 
-    def test_producto_desconocido_devuelve_lista_vacia(self):
+    def test_unknown_product_returns_empty_list(self):
         self.assertEqual(db.query_cheapest("Inexistente"), [])
 
-    def test_solo_mira_el_producto_pedido(self):
+    def test_only_looks_at_the_requested_product(self):
         db.update_price("Leche", "Lidl", 1.10)
         db.update_price("Pan", "Lidl", 0.90)
         self.assertEqual(db.query_cheapest("Leche"), [("Lidl", 1.10)])
 
 
 class TestListCurrent(DbTestCase):
-    def test_lista_vacia_al_principio(self):
+    def test_empty_list_at_the_start(self):
         self.assertEqual(db.list_current(), [])
 
-    def test_devuelve_dicts_con_todas_las_columnas(self):
+    def test_returns_dicts_with_every_column(self):
         db.add_item("Leche", "Mercadona", 1.20)
         item = db.list_current()[0]
         self.assertEqual(
@@ -171,7 +171,7 @@ class TestListCurrent(DbTestCase):
         self.assertEqual(item["producto"], "Leche")
         self.assertEqual(item["supermercado"], "Mercadona")
 
-    def test_ordenado_por_producto_y_supermercado(self):
+    def test_sorted_by_product_and_supermarket(self):
         db.add_item("Leche", "Mercadona", 1.20)
         db.add_item("Pan", "Lidl", 0.90)
         db.add_item("Leche", "Lidl", 1.05)

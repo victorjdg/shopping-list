@@ -1,24 +1,23 @@
 """
-Servidor MCP de la lista de la compra: expone las 5 herramientas CRUD/E de db/db.py
-(add_item, remove_item, update_price, query_cheapest, list_current) para que un
-modelo (Mistral AI, conectado como "Connector" remoto vía HTTP) pueda consultar y
-modificar la lista de la compra y el histórico de precios por lenguaje natural.
+Shopping list MCP server: exposes db/db.py's 5 CRUD/query tools (add_item, remove_item,
+update_price, query_cheapest, list_current) so a model (Mistral AI, connected as a remote
+"Connector" over HTTP) can query and modify the shopping list and price history via
+natural language.
 
-Mismo patrón de punta a punta que podman/mcp-server (Server): FastMCP del SDK
-oficial `mcp` 1.x con transporte Streamable HTTP montado en "/mcp", escuchando en
-0.0.0.0:8000 dentro del contenedor, y autenticación por middleware ASGI que exige
-"Authorization: Bearer <token>" (MCP_AUTH_TOKEN) en cada petición, rechazando con
-401 antes de llegar al manejador MCP.
+Same end-to-end pattern as any FastMCP-based server: official `mcp` 1.x SDK with
+Streamable HTTP transport mounted at "/mcp", listening on 0.0.0.0:8000 inside the
+container, and auth via an ASGI middleware that requires "Authorization: Bearer <token>"
+(MCP_AUTH_TOKEN) on every request, rejecting with 401 before reaching the MCP handler.
 
-La base de datos SQLite vive en el volumen montado en /appdata (ver 01-deploy.sh);
-la ruta exacta se pasa en SHOPPING_LIST_DB. db/ no se toca: se importa tal cual y
-se le parchea db.DB_PATH, inicializando el schema con initdb.init_db(ruta) de
-forma explícita (ojo: el argumento por defecto de init_db apunta a la ruta que
-db/ usa en local, no a la del contenedor -- por eso se pasa siempre explícitamente).
+The SQLite database lives on the volume mounted at /appdata (see 01-deploy.sh); the exact
+path is passed via SHOPPING_LIST_DB. db/ is imported as-is, unmodified: db.DB_PATH gets
+patched, and the schema is initialized explicitly via initdb.init_db(path) (note: the
+default argument of init_db points at the path db/ uses locally, not the container's --
+that's why it's always passed explicitly).
 
-Nota sobre versión del SDK: mcp 2.x renombró la clase FastMCP a MCPServer y cambió
-otras APIs; esta app usa FastMCP tal cual existe en la serie 1.x, así que
-requirements.txt fija mcp<2.
+Note on SDK version: mcp 2.x renamed the FastMCP class to MCPServer and changed other
+APIs; this app uses FastMCP as it exists in the 1.x series, so requirements.txt pins
+mcp<2.
 """
 
 from __future__ import annotations
@@ -33,16 +32,16 @@ from mcp.server.fastmcp import FastMCP
 from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
-# Nota: importar mistralai.workflows.client (usado mas abajo, en process_receipt_photo)
-# imprime un log INFO ruidoso con la configuracion completa del SDK de Workflows (piensa
-# que puede arrancar un worker, aunque aqui solo se usa como cliente) -- esperado, no es
-# un error. Se ve una vez al arrancar el contenedor (import a nivel de modulo), no en
-# cada llamada a la tool.
+# Note: importing mistralai.workflows.client (used further down, in
+# process_receipt_photo) prints a noisy INFO log with the full Workflows SDK
+# configuration (it's built to potentially run a worker, even though it's only used
+# here as a client) -- expected, not an error. Shows up once at container startup
+# (module-level import), not on every tool call.
 from mistralai.extra.workflows import WorkflowEncodingConfig, configure_workflow_encoding
 from mistralai.workflows.client import get_mistral_client
 
-# db/ vive un nivel por encima de mcp/ (../db desde este fichero), igual que en
-# local. En el contenedor: /app/mcp/server.py -> /app/db.
+# db/ lives one level above mcp/ (../db from this file), same as locally.
+# Inside the container: /app/mcp/server.py -> /app/db.
 DB_DIR = Path(__file__).resolve().parent.parent / "db"
 sys.path.insert(0, str(DB_DIR))
 
@@ -50,83 +49,82 @@ import db  # noqa: E402
 import initdb  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# Configuración y validación de entorno
+# Configuration and environment validation
 # ---------------------------------------------------------------------------
 
 try:
     MCP_AUTH_TOKEN: str = os.environ["MCP_AUTH_TOKEN"]
 except KeyError as exc:
     sys.stderr.write(
-        "ERROR FATAL: la variable de entorno MCP_AUTH_TOKEN es obligatoria y no está "
-        "definida. Define MCP_AUTH_TOKEN con un token secreto antes de arrancar el "
-        "servidor (por ejemplo: -e MCP_AUTH_TOKEN=... en el contenedor).\n"
+        "FATAL ERROR: the MCP_AUTH_TOKEN environment variable is required and not "
+        "set. Set MCP_AUTH_TOKEN to a secret token before starting the server (e.g. "
+        "-e MCP_AUTH_TOKEN=... on the container).\n"
     )
     raise RuntimeError(
-        "Falta la variable de entorno obligatoria MCP_AUTH_TOKEN."
+        "Missing required environment variable MCP_AUTH_TOKEN."
     ) from exc
 
 if not MCP_AUTH_TOKEN.strip():
     raise RuntimeError(
-        "La variable de entorno MCP_AUTH_TOKEN está definida pero vacía. "
-        "Debe contener un token secreto no vacío."
+        "The MCP_AUTH_TOKEN environment variable is set but empty. "
+        "It must contain a non-empty secret token."
     )
 
-# Credenciales para disparar el Workflow "shopping-receipt" (Mistral Workflows) desde la
-# tool process_receipt_photo -- mismo patrón de validación temprana que MCP_AUTH_TOKEN.
-# WORKFLOWS_DEPLOYMENT_NAME debe coincidir con el worker real que registra ese workflow
-# (~/mistral-workflow-project en el servidor, ver Server/podman/mistral-workflow/README.md).
+# Credentials to trigger the "shopping-receipt" Workflow (Mistral Workflows) from the
+# process_receipt_photo tool -- same early-validation pattern as MCP_AUTH_TOKEN.
+# WORKFLOWS_DEPLOYMENT_NAME must match the deployment of the worker that registers that
+# workflow (see workflow/README.md).
 try:
     MISTRAL_API_KEY: str = os.environ["MISTRAL_API_KEY"]
 except KeyError as exc:
     sys.stderr.write(
-        "ERROR FATAL: la variable de entorno MISTRAL_API_KEY es obligatoria (necesaria "
-        "para disparar el Workflow shopping-receipt desde process_receipt_photo).\n"
+        "FATAL ERROR: the MISTRAL_API_KEY environment variable is required (needed "
+        "to trigger the shopping-receipt Workflow from process_receipt_photo).\n"
     )
-    raise RuntimeError("Falta la variable de entorno obligatoria MISTRAL_API_KEY.") from exc
+    raise RuntimeError("Missing required environment variable MISTRAL_API_KEY.") from exc
 
 try:
     WORKFLOWS_DEPLOYMENT_NAME: str = os.environ["WORKFLOWS_DEPLOYMENT_NAME"]
 except KeyError as exc:
     sys.stderr.write(
-        "ERROR FATAL: la variable de entorno WORKFLOWS_DEPLOYMENT_NAME es obligatoria "
-        "(nombre del deployment del worker que registra el workflow shopping-receipt).\n"
+        "FATAL ERROR: the WORKFLOWS_DEPLOYMENT_NAME environment variable is required "
+        "(deployment name of the worker that registers the shopping-receipt workflow).\n"
     )
     raise RuntimeError(
-        "Falta la variable de entorno obligatoria WORKFLOWS_DEPLOYMENT_NAME."
+        "Missing required environment variable WORKFLOWS_DEPLOYMENT_NAME."
     ) from exc
 
 WORKFLOWS_SERVER_URL = os.environ.get("WORKFLOWS_SERVER_URL", "https://api.mistral.ai")
 
-# Ruta del fichero SQLite. En el contenedor apunta al volumen /appdata (ver
-# 01-deploy.sh); si no se define, cae a la que db/ usa por defecto (útil para
-# pruebas en local sin contenedor).
+# SQLite file path. Inside the container points at the /appdata volume (see
+# 01-deploy.sh); if unset, falls back to whatever db/ uses by default (handy for local
+# testing without a container).
 SHOPPING_LIST_DB = Path(os.environ.get("SHOPPING_LIST_DB", str(db.DB_PATH)))
 
-# Inicializa (de forma idempotente, CREATE TABLE IF NOT EXISTS) el schema en la
-# ruta definitiva ANTES de parchear db.DB_PATH: el fallback de db._connect()
-# llamaría a init_db() sin argumento, que crearía el fichero en la ruta por
-# defecto de db/, no en la del volumen.
+# Initializes (idempotently, CREATE TABLE IF NOT EXISTS) the schema at the final path
+# BEFORE patching db.DB_PATH: db._connect()'s fallback would call init_db() with no
+# argument, which would create the file at db/'s default path, not the volume's.
 initdb.init_db(SHOPPING_LIST_DB)
 db.DB_PATH = SHOPPING_LIST_DB
 
 # ---------------------------------------------------------------------------
-# Servidor MCP
+# MCP server
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP(
     name="shopping-list",
     instructions=(
-        "Lista de la compra compartida con histórico de precios por supermercado. "
-        "Permite añadir y quitar productos de la lista, registrar precios "
-        "observados y consultar dónde está más barato un producto ahora mismo "
-        "según el último precio conocido de cada supermercado.\n\n"
-        "IMPORTANTE sobre fotos de tickets de compra: si el usuario adjunta una foto de "
-        "un ticket, NO leas tú mismo los precios de la imagen ni llames a update_price "
-        "línea por línea -- aunque puedas ver la foto, los tickets con descuentos o "
-        "promociones necesitan un cálculo que un modelo no hace de forma fiable (se ha "
-        "verificado en pruebas reales: falla la aritmética de descuentos). Llama SIEMPRE "
-        "a process_receipt_photo pasándole la imagen en base64 y deja que ese proceso "
-        "haga el cálculo; no proceses el ticket por tu cuenta bajo ninguna circunstancia."
+        "Shared shopping list with per-supermarket price history. Lets you add and "
+        "remove products from the list, log observed prices, and check where a "
+        "product is cheapest right now based on the latest known price at each "
+        "supermarket.\n\n"
+        "IMPORTANT about receipt photos: if the user attaches a photo of a receipt, do "
+        "NOT read the prices from the image yourself or call update_price line by "
+        "line -- even though you can see the photo, receipts with discounts or "
+        "promotions need a calculation a model doesn't do reliably (verified in real "
+        "tests: it gets the discount arithmetic wrong). ALWAYS call "
+        "process_receipt_photo with the image in base64 and let that process do the "
+        "math; never process the receipt yourself under any circumstances."
     ),
     host="0.0.0.0",
     port=8000,
@@ -136,191 +134,186 @@ mcp = FastMCP(
 
 @mcp.tool()
 def add_item(producto: str, supermercado: str, precio: float | None = None) -> str:
-    """Añade un producto a la lista de la compra.
+    """Adds a product to the shopping list.
 
-    Si el producto ya estaba en la lista para ese supermercado, no se duplica:
-    se actualiza su último precio y su fecha. El precio es opcional -- si el
-    usuario no lo dice, se añade sin precio y se rellenará cuando se observe un
-    precio real (por chat o procesando un ticket).
+    If the product is already on the list for that supermarket, it isn't duplicated:
+    its last known price and date get updated instead. The price is optional -- if the
+    user doesn't give one, it's added without a price, to be filled in later when a
+    real price is observed (via chat or by processing a receipt).
 
-    Ojo: el precio que se pasa aquí se guarda solo como último precio de la
-    lista, NO queda registrado en el histórico de precios. Si el usuario da un
-    precio que acaba de ver ("he visto la leche a 1,20 en el Mercadona"),
-    usa update_price en su lugar para que quede en el histórico.
+    Note: the price passed here is stored only as the list's last known price, it is
+    NOT logged to price history. If the user gives a price they just observed ("I saw
+    milk at 1.20 at the supermarket"), use update_price instead so it gets logged.
 
-    Útil ante peticiones como "añade leche del Mercadona a la lista" o
-    "pon el pan de Lidl, cuesta 0,90".
+    Useful for requests like "add milk from the supermarket to the list" or "add bread
+    from the discount store, it costs 0.90".
 
     Args:
-        producto: nombre del producto en el formato en que lo dice el usuario
-            (p. ej. "leche entera"). La identidad del ítem es la pareja
-            (producto, supermercado).
-        supermercado: nombre del supermercado (p. ej. "Mercadona", "Lidl"). Si
-            el usuario no especifica uno, pregúntaselo antes de llamar.
-        precio: precio en euros observado para ese producto en ese
-            supermercado, si se conoce. Opcional.
+        producto: product name in whatever form the user says it (e.g. "whole milk").
+            The item's identity is the (producto, supermercado) pair.
+        supermercado: supermarket name (e.g. "Lidl", "Mercadona"). If the user doesn't
+            specify one, ask before calling.
+        precio: observed price in euros for that product at that supermarket, if
+            known. Optional.
     """
     try:
         db.add_item(producto, supermercado, precio)
-    except Exception as exc:  # noqa: BLE001 - mensaje legible, no stacktrace
-        return f"Error al añadir '{producto}' ({supermercado}): {exc}"
+    except Exception as exc:  # noqa: BLE001 - readable message, not a stack trace
+        return f"Error adding '{producto}' ({supermercado}): {exc}"
 
     if precio is None:
-        return f"Añadido a la lista: {producto} ({supermercado}), sin precio todavía."
+        return f"Added to the list: {producto} ({supermercado}), no price yet."
     return (
-        f"Añadido a la lista: {producto} ({supermercado}) a {precio:.2f} € "
-        "(como último precio de la lista; no se ha registrado en el histórico)."
+        f"Added to the list: {producto} ({supermercado}) at {precio:.2f} EUR "
+        "(as the list's last known price; not logged to price history)."
     )
 
 
 @mcp.tool()
 def remove_item(producto: str, supermercado: str) -> str:
-    """Quita un producto de la lista de la compra.
+    """Removes a product from the shopping list.
 
-    Borra solo el ítem (producto, supermercado) pedido. El histórico de precios
-    NO se toca: los precios observados de ese producto se conservan, así que
-    seguirá respondiendo a query_cheapest aunque ya no esté en la lista.
+    Only deletes the requested (producto, supermercado) item. Price history is NOT
+    touched: observed prices for that product are kept, so it will still answer
+    query_cheapest even after being removed from the list.
 
-    Útil ante peticiones como "quita la leche del Mercadona" o "ya no quiero el
-    pan de Lidl".
+    Useful for requests like "remove milk from the supermarket" or "I don't need the
+    bread from the discount store anymore".
 
     Args:
-        producto: nombre del producto tal y como está en la lista (usa
-            list_current si no estás seguro de cómo está guardado).
-        supermercado: supermercado del ítem a quitar.
+        producto: product name exactly as it's stored on the list (use list_current
+            if you're not sure how it's stored).
+        supermercado: supermarket of the item to remove.
     """
     try:
         existed = db.remove_item(producto, supermercado)
     except Exception as exc:  # noqa: BLE001
-        return f"Error al quitar '{producto}' ({supermercado}): {exc}"
+        return f"Error removing '{producto}' ({supermercado}): {exc}"
 
     if existed:
-        return f"Quitado de la lista: {producto} ({supermercado})."
-    return f"No estaba en la lista: {producto} ({supermercado})."
+        return f"Removed from the list: {producto} ({supermercado})."
+    return f"Wasn't on the list: {producto} ({supermercado})."
 
 
 @mcp.tool()
 def update_price(producto: str, supermercado: str, precio: float) -> str:
-    """Registra un precio observado de un producto en un supermercado.
+    """Logs an observed price for a product at a supermarket.
 
-    Hace dos cosas en una sola transacción: actualiza el último precio del ítem
-    en la lista de la compra (si está en ella) y añade una fila al histórico de
-    precios con fecha y hora. Es la herramienta correcta cuando el usuario dice
-    que ha visto un precio, tanto si el producto está en la lista como si no
-    (el histórico guarda precios de productos aunque no estén en la lista).
+    Does two things in a single transaction: updates the item's last known price on
+    the shopping list (if it's on it) and appends a row to price history with a
+    timestamp. The right tool whenever the user says they've seen a price, whether or
+    not the product is currently on the list (price history keeps prices for products
+    even if they're not on the list).
 
-    Útil ante peticiones como "la leche en el Lidl está ahora a 1,10" o "he
-    pagado el pan 0,95 en el Mercadona".
+    Useful for requests like "milk at the supermarket is now 1.10" or "I paid 0.95 for
+    bread at the discount store".
 
-    NO uses esta tool para procesar una foto de un ticket de compra, ni siquiera si
-    puedes ver los precios en la imagen -- usa process_receipt_photo en su lugar,
-    que calcula bien los descuentos y promociones (un modelo leyendo el ticket a
-    ojo falla esa aritmética). Esta tool es solo para un precio suelto que el
-    usuario menciona por texto.
+    Do NOT use this tool to process a photo of a receipt, even if you can see the
+    prices in the image -- use process_receipt_photo instead, which correctly
+    calculates discounts and promotions (a model eyeballing a receipt gets that
+    arithmetic wrong). This tool is only for a single price the user mentions in text.
 
     Args:
-        producto: nombre del producto (p. ej. "leche entera").
-        supermercado: supermercado donde se ha visto el precio.
-        precio: precio en euros observado.
+        producto: product name (e.g. "whole milk").
+        supermercado: supermarket where the price was observed.
+        precio: observed price in euros.
     """
     try:
         db.update_price(producto, supermercado, precio)
     except Exception as exc:  # noqa: BLE001
-        return f"Error al registrar el precio de '{producto}' ({supermercado}): {exc}"
+        return f"Error logging the price of '{producto}' ({supermercado}): {exc}"
 
     return (
-        f"Registrado: {producto} a {precio:.2f} € en {supermercado}. "
-        "Actualizado el último precio de la lista y añadido al histórico."
+        f"Logged: {producto} at {precio:.2f} EUR at {supermercado}. "
+        "Updated the list's last known price and added it to price history."
     )
 
 
 @mcp.tool()
 def query_cheapest(producto: str) -> str:
-    """Consulta dónde está más barato un producto AHORA, por supermercado.
+    """Checks where a product is cheapest RIGHT NOW, per supermarket.
 
-    Devuelve el precio MÁS RECIENTE conocido de cada supermercado (según el
-    histórico de precios), ordenado de más barato a más caro -- no el precio
-    más bajo que tuvo nunca. Solo incluye supermercados de los que se ha
-    registrado algún precio de ese producto en algún momento.
+    Returns the MOST RECENT known price at each supermarket (from price history),
+    sorted cheapest to most expensive -- not the lowest price it's ever had. Only
+    includes supermarkets that have at least one logged price for that product.
 
-    Útil ante peticiones como "¿dónde está más barata la leche?" o "¿cuánto
-    cuesta el pan en cada súper?".
+    Useful for requests like "where's milk cheapest?" or "how much does bread cost at
+    each supermarket?".
 
     Args:
-        producto: nombre del producto a consultar (p. ej. "leche entera"). Si no
-            hay ningún precio registrado, se devuelve un mensaje indicándolo.
+        producto: product name to look up (e.g. "whole milk"). If no price has been
+            logged for it, a message says so.
     """
     try:
         results = db.query_cheapest(producto)
     except Exception as exc:  # noqa: BLE001
-        return f"Error al consultar los precios de '{producto}': {exc}"
+        return f"Error querying prices for '{producto}': {exc}"
 
     if not results:
         return (
-            f"No hay ningún precio registrado de '{producto}' todavía. "
-            "Regístralo con update_price cuando se observe uno."
+            f"No price has been logged for '{producto}' yet. "
+            "Log one with update_price when one is observed."
         )
 
-    lines = [f"Precios más recientes de {producto} (de más barato a más caro):"]
+    lines = [f"Most recent prices for {producto} (cheapest to most expensive):"]
     for i, (supermercado, precio) in enumerate(results, start=1):
-        lines.append(f"{i}. {supermercado}: {precio:.2f} €")
+        lines.append(f"{i}. {supermercado}: {precio:.2f} EUR")
     return "\n".join(lines)
 
 
 @mcp.tool()
 def list_current() -> str:
-    """Muestra todo el contenido actual de la lista de la compra.
+    """Shows everything currently on the shopping list.
 
-    Devuelve cada ítem con su producto, supermercado, último precio conocido (si
-    lo hay) y cuándo se actualizó por última vez. Útil ante peticiones como
-    "¿qué hay en la lista?" o "muéstrame la lista de la compra", y también para
-    comprobar cómo está guardado exactamente un producto antes de quitarlo o
-    actualizar su precio.
+    Returns each item with its product, supermarket, last known price (if any), and
+    when it was last updated. Useful for requests like "what's on the list?" or "show
+    me the shopping list", and also to check exactly how a product is stored before
+    removing it or updating its price.
     """
     try:
         items = db.list_current()
     except Exception as exc:  # noqa: BLE001
-        return f"Error al leer la lista de la compra: {exc}"
+        return f"Error reading the shopping list: {exc}"
 
     if not items:
-        return "La lista de la compra está vacía."
+        return "The shopping list is empty."
 
-    lines = ["Lista de la compra:"]
+    lines = ["Shopping list:"]
     for item in items:
         if item["ultimo_precio"] is None:
-            lines.append(f"- {item['producto']} ({item['supermercado']}): sin precio todavía")
+            lines.append(f"- {item['producto']} ({item['supermercado']}): no price yet")
         else:
             lines.append(
                 f"- {item['producto']} ({item['supermercado']}): "
-                f"{item['ultimo_precio']:.2f} € (actualizado {item['actualizado_en']})"
+                f"{item['ultimo_precio']:.2f} EUR (updated {item['actualizado_en']})"
             )
     return "\n".join(lines)
 
 
 @mcp.tool()
 async def process_receipt_photo(imagen_base64: str) -> str:
-    """Procesa la foto de un ticket de compra: hace OCR, identifica los productos y sus
-    precios reales (ya con descuentos aplicados), y actualiza la lista de la compra --
-    registra el precio en el histórico y quita de la lista los productos que ya estaban
-    en ella. Los productos con alguna ambigüedad genuina (letra poco clara del OCR,
-    varias coincidencias posibles en la lista, etc.) NO se tocan automáticamente: se
-    devuelven aparte para que el usuario los revise a mano.
+    """Processes a photo of a shopping receipt: runs OCR, identifies the products and
+    their real prices (with discounts already applied), and updates the shopping list
+    -- logs the price to history and removes from the list any products that were
+    already on it. Products with genuine ambiguity (unclear OCR text, several possible
+    matches on the list, etc.) are NOT touched automatically: they're returned
+    separately for the user to review by hand.
 
-    Dispara el Workflow "shopping-receipt" (Mistral Workflows) y espera su resultado --
-    puede tardar unos segundos (hace OCR y una llamada al modelo antes de responder).
+    Triggers the "shopping-receipt" Workflow (Mistral Workflows) and waits for its
+    result -- can take a few seconds (it runs OCR and a model call before responding).
 
-    Útil ante peticiones como "he subido la foto del ticket, procésalo" cuando el usuario
-    adjunta una foto de un ticket de supermercado en la conversación.
+    Useful for requests like "I've uploaded the receipt photo, process it" when the
+    user attaches a photo of a supermarket receipt in the conversation.
 
-    ES LA ÚNICA FORMA CORRECTA de procesar un ticket, aunque puedas ver la imagen tú
-    mismo: NO leas los precios de la foto y los registres a mano con update_price --
-    un modelo leyendo un ticket a ojo falla la aritmética de descuentos y promociones
-    (verificado en pruebas reales). Pásale siempre la imagen a esta tool y deja que
-    calcule ella los precios finales.
+    THIS IS THE ONLY CORRECT WAY to process a receipt, even though you can see the
+    image yourself: do NOT read the prices off the photo and log them by hand with
+    update_price -- a model eyeballing a receipt gets the discount/promotion
+    arithmetic wrong (verified in real tests). Always pass the image to this tool and
+    let it compute the final prices.
 
     Args:
-        imagen_base64: contenido de la foto del ticket codificado en base64 (solo los
-            bytes de la imagen, sin el prefijo "data:image/...;base64,").
+        imagen_base64: the receipt photo's content, base64-encoded (just the image
+            bytes, without the "data:image/...;base64," prefix).
     """
     try:
         client = get_mistral_client(api_key=MISTRAL_API_KEY, server_url=WORKFLOWS_SERVER_URL)
@@ -330,25 +323,25 @@ async def process_receipt_photo(imagen_base64: str) -> str:
             input={"imagen_base64": imagen_base64},
             deployment_name=WORKFLOWS_DEPLOYMENT_NAME,
         )
-    except Exception as exc:  # noqa: BLE001 - mensaje legible, no stacktrace
-        return f"Error al procesar el ticket: {exc}"
+    except Exception as exc:  # noqa: BLE001 - readable message, not a stack trace
+        return f"Error processing the receipt: {exc}"
 
     return str(result)
 
 
 # ---------------------------------------------------------------------------
-# Middleware ASGI de autenticación (Bearer token) y arranque del servidor
+# Bearer-token auth ASGI middleware, and server startup
 # ---------------------------------------------------------------------------
 
 
 class BearerAuthMiddleware:
-    """Middleware ASGI puro que exige `Authorization: Bearer <token>` en /mcp.
+    """Pure ASGI middleware that requires `Authorization: Bearer <token>` on /mcp.
 
-    Se aplica antes de despachar al manejador MCP: si la cabecera falta o no
-    coincide con MCP_AUTH_TOKEN, responde 401 directamente sin invocar la app
-    envuelta. Los eventos de tipo "lifespan" se dejan pasar sin comprobar nada
-    (son inicio/parada del proceso, no peticiones HTTP), para que el
-    StreamableHTTPSessionManager de FastMCP arranque y pare correctamente.
+    Applied before dispatching to the MCP handler: if the header is missing or
+    doesn't match MCP_AUTH_TOKEN, it responds with 401 directly without invoking the
+    wrapped app. "lifespan" events are passed through without any check (they're
+    process start/stop, not HTTP requests), so FastMCP's StreamableHTTPSessionManager
+    starts and stops correctly.
     """
 
     def __init__(self, app, token: str) -> None:
@@ -365,7 +358,7 @@ class BearerAuthMiddleware:
 
         if not auth_header or not secrets.compare_digest(auth_header, self._expected_header):
             response = JSONResponse(
-                {"error": "unauthorized", "detail": "Falta o es inválida la cabecera Authorization: Bearer <token>."},
+                {"error": "unauthorized", "detail": "Missing or invalid Authorization: Bearer <token> header."},
                 status_code=401,
                 headers={"WWW-Authenticate": "Bearer"},
             )
@@ -375,11 +368,11 @@ class BearerAuthMiddleware:
         await self.app(scope, receive, send)
 
 
-# App ASGI subyacente que expone FastMCP en Streamable HTTP, montada en "/mcp"
-# (settings.mount_path="/" + settings.streamable_http_path="/mcp" -> path final "/mcp").
+# Underlying ASGI app exposing FastMCP over Streamable HTTP, mounted at "/mcp"
+# (settings.mount_path="/" + settings.streamable_http_path="/mcp" -> final path "/mcp").
 _streamable_http_app = mcp.streamable_http_app()
 
-# App final: middleware de autenticación envolviendo la app MCP.
+# Final app: auth middleware wrapping the MCP app.
 app = BearerAuthMiddleware(_streamable_http_app, MCP_AUTH_TOKEN)
 
 

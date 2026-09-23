@@ -1,6 +1,6 @@
-# El contexto de build es la RAÍZ del proyecto (shopping-list/), no este
-# directorio: el servidor importa db/ tal cual (db.py, initdb.py, schema.sql),
-# así que la imagen necesita copiar ambos. Se construye con:
+# The build context is the project ROOT (shopping-list/), not this directory: the
+# server imports db/ as-is (db.py, initdb.py, schema.sql), so the image needs to copy
+# both. Build with:
 #   podman build -f mcp/Dockerfile -t shopping-list:latest .
 FROM python:3.12-slim
 

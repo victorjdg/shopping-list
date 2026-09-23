@@ -1,8 +1,8 @@
-"""Crea (o inicializa) la base de datos SQLite del proyecto.
+"""Creates (or initializes) the project's SQLite database.
 
-Abre el fichero .sqlite con sqlite3.connect (lo crea si no existe) y ejecuta
-schema.sql con executescript. Gracias a CREATE TABLE IF NOT EXISTS se puede
-lanzar varias veces sin error.
+Opens the .sqlite file with sqlite3.connect (creating it if it doesn't
+exist) and runs schema.sql via executescript. Thanks to CREATE TABLE IF NOT
+EXISTS, it can be run more than once without error.
 """
 
 import sqlite3
@@ -20,4 +20,4 @@ def init_db(db_path: Path = DB_PATH) -> None:
 
 if __name__ == "__main__":
     init_db()
-    print(f"Base de datos lista: {DB_PATH}")
+    print(f"Database ready: {DB_PATH}")

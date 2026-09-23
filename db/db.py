@@ -1,9 +1,9 @@
-"""Funciones de acceso a la base de datos (lista_compra e historico_precios).
+"""Database access functions (lista_compra and historico_precios).
 
-Cada función abre su propia conexión a DB_PATH (creando el fichero y las
-tablas si es la primera vez). _connect() garantiza a la salida del `with`
-las dos cosas que sqlite3 separa: commit/rollback de la transacción y
-cierre determinista de la conexión (no dependemos del recolector de basura).
+Each function opens its own connection to DB_PATH (creating the file and
+tables the first time). _connect() guarantees, on exiting the `with`, the two
+things sqlite3 keeps separate: transaction commit/rollback and deterministic
+connection close (not relying on the garbage collector).
 """
 
 import sqlite3
@@ -15,20 +15,20 @@ from initdb import DB_PATH, init_db
 
 
 def _now() -> str:
-    """Timestamp ISO 8601 en UTC. Formato fijo -> ordenar como texto es
-    ordenar cronológicamente, clave para query_cheapest."""
+    """ISO 8601 UTC timestamp. Fixed format -> sorting as text sorts
+    chronologically, which query_cheapest relies on."""
     return datetime.now(timezone.utc).isoformat()
 
 
 @contextmanager
 def _connect() -> Iterator[sqlite3.Connection]:
-    """Conexión con transacción y cierre determinista.
+    """Connection with transaction handling and deterministic close.
 
-    Ojo con sqlite3: `with sqlite3.connect(...) as conn` solo hace
-    commit/rollback (NO cierra), y conn.close() solo cierra (NO confirma
-    transacciones pendientes). Aquí se combinan los dos: el `with conn`
-    interno gestiona la transacción y el `finally` cierra siempre, salga
-    bien o salte una excepción.
+    Watch out with sqlite3: `with sqlite3.connect(...) as conn` only does
+    commit/rollback (does NOT close), and conn.close() only closes (does NOT
+    commit pending transactions). Here both are combined: the inner `with
+    conn` manages the transaction and `finally` always closes, whether it
+    succeeds or an exception is raised.
     """
     if not DB_PATH.exists():
         init_db()
@@ -41,13 +41,12 @@ def _connect() -> Iterator[sqlite3.Connection]:
 
 
 def add_item(producto: str, supermercado: str, precio: float | None) -> None:
-    """Inserta el ítem; si ya existe la pareja (producto, supermercado),
-    actualiza su precio y fecha.
+    """Inserts the item; if the (producto, supermercado) pair already
+    exists, updates its price and date instead.
 
-    El precio se guarda SOLO en lista_compra: no se registra en
-    historico_precios. Si al implementar la tool del Agent (Fase 2) se
-    quiere que "añadir con precio" cuente como observación de precio,
-    hay que llamar también a update_price — decisión pendiente.
+    The price is stored ONLY in lista_compra: it is not logged to
+    historico_precios. If an observed price needs to land in price history,
+    use update_price instead (see mcp/server.py).
     """
     with _connect() as conn:
         conn.execute(
@@ -63,7 +62,7 @@ def add_item(producto: str, supermercado: str, precio: float | None) -> None:
 
 
 def remove_item(producto: str, supermercado: str) -> bool:
-    """Borra el ítem de la lista. Devuelve True si existía, False si no."""
+    """Deletes the item from the list. Returns True if it existed, False otherwise."""
     with _connect() as conn:
         cur = conn.execute(
             "DELETE FROM lista_compra WHERE producto = ? AND supermercado = ?",
@@ -73,8 +72,8 @@ def remove_item(producto: str, supermercado: str) -> bool:
 
 
 def update_price(producto: str, supermercado: str, precio: float) -> None:
-    """Actualiza ultimo_precio en lista_compra y añade una fila en
-    historico_precios, ambas en la misma transacción."""
+    """Updates ultimo_precio in lista_compra and appends a row to
+    historico_precios, both in the same transaction."""
     ahora = _now()
     with _connect() as conn:
         conn.execute(
@@ -95,9 +94,9 @@ def update_price(producto: str, supermercado: str, precio: float) -> None:
 
 
 def query_cheapest(producto: str) -> list[tuple[str, float]]:
-    """Precio más reciente de cada supermercado para ese producto, ordenado
-    de más barato a más caro. Se apoya en que fecha es ISO 8601 con formato
-    fijo, así que MAX(fecha) por supermercado es el último precio visto."""
+    """Most recent price at each supermarket for that product, sorted
+    cheapest to most expensive. Relies on `fecha` being ISO 8601 in a fixed
+    format, so MAX(fecha) per supermarket is the latest observed price."""
     with _connect() as conn:
         rows = conn.execute(
             """
@@ -120,7 +119,7 @@ def query_cheapest(producto: str) -> list[tuple[str, float]]:
 
 
 def list_current() -> list[dict]:
-    """Todo el contenido actual de lista_compra."""
+    """Everything currently in lista_compra."""
     with _connect() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(

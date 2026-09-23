@@ -1,13 +1,13 @@
-"""Backup diario del SQLite de la lista de la compra (Fase 5 de PLAN.md).
+"""Daily backup of the shopping list's SQLite database.
 
-Usa la API `sqlite3.Connection.backup()` (no un `cp` a pelo) porque el fichero puede estar
-abierto/en uso por el MCP server en el momento del backup -- `backup()` hace una copia
-consistente de una base de datos SQLite en uso, un `cp` normal podría capturar un estado a
-medio escribir. Pensado para lanzarse una vez al día vía cron (ver README.md de este
-directorio), no dentro de un contenedor -- es un script suelto, sqlite3 ya es de la librería
-estándar de Python (no hace falta ninguna dependencia nueva).
+Uses the `sqlite3.Connection.backup()` API (not a plain `cp`) because the file may be
+open/in use by the MCP server at backup time -- `backup()` makes a consistent copy of a
+SQLite database that's in use, whereas a plain `cp` could capture a mid-write,
+inconsistent state. Meant to run once a day via cron (see this directory's README.md),
+not inside a container -- it's a standalone script, sqlite3 is already part of Python's
+standard library (no new dependency needed).
 
-Uso: python3 backup.py <db_origen> <directorio_destino> [dias_retencion]
+Usage: python3 backup.py <source_db> <backup_dir> [retention_days]
 """
 
 import shutil
@@ -50,7 +50,7 @@ def prune_old_backups(backup_dir: Path, retention_days: int) -> list[Path]:
 
 def main() -> None:
     if len(sys.argv) not in (3, 4):
-        print(f"Uso: {sys.argv[0]} <db_origen> <directorio_destino> [dias_retencion]", file=sys.stderr)
+        print(f"Usage: {sys.argv[0]} <source_db> <backup_dir> [retention_days]", file=sys.stderr)
         sys.exit(1)
 
     db_path = Path(sys.argv[1])
@@ -58,22 +58,22 @@ def main() -> None:
     retention_days = int(sys.argv[3]) if len(sys.argv) == 4 else DEFAULT_RETENTION_DAYS
 
     if not db_path.exists():
-        print(f"Error: no existe la base de datos origen {db_path}", file=sys.stderr)
+        print(f"Error: source database {db_path} doesn't exist", file=sys.stderr)
         sys.exit(1)
 
     dest = backup(db_path, backup_dir)
     size = dest.stat().st_size
-    print(f"Backup creado: {dest} ({size} bytes)")
+    print(f"Backup created: {dest} ({size} bytes)")
 
     removed = prune_old_backups(backup_dir, retention_days)
     if removed:
-        print(f"Backups antiguos eliminados (>{retention_days} días): {len(removed)}")
+        print(f"Old backups removed (>{retention_days} days): {len(removed)}")
 
-    # Ocupación total del directorio de backups, para detectar crecimiento inesperado a simple
-    # vista en el log de cron sin tener que entrar a mirar a mano.
+    # Total size of the backup directory, to spot unexpected growth at a glance in the
+    # cron log without having to go check by hand.
     total = sum(f.stat().st_size for f in backup_dir.glob("shopping_list-*.sqlite"))
-    print(f"Total en {backup_dir}: {shutil.disk_usage(backup_dir).used} usados en el disco, "
-          f"{total} bytes en backups de la lista")
+    print(f"Total in {backup_dir}: {shutil.disk_usage(backup_dir).used} bytes used on disk, "
+          f"{total} bytes in list backups")
 
 
 if __name__ == "__main__":

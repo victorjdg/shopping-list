@@ -1,38 +1,40 @@
-# Backups del SQLite de la lista de la compra
+# SQLite backups
 
-`backup.py` hace una copia consistente diaria de `shopping_list.sqlite` (via
-`sqlite3.Connection.backup()`, seguro aunque el fichero esté en uso) y elimina las copias de
-más de 14 días. Se lanza por cron en `vdiaz`, no dentro de un contenedor -- es un script suelto
-sin dependencias nuevas (`sqlite3` es de la librería estándar).
+`backup.py` makes a consistent daily copy of `shopping_list.sqlite` via
+`sqlite3.Connection.backup()` (safe even while the file is in use by the running container —
+unlike a plain `cp`, which could capture a mid-write, inconsistent state) and prunes copies
+older than 14 days.
 
-Destino: `/mnt/storage/backups/shopping-list/` -- **mismo disco físico (`sda`) que la base de
-datos origen** (`/mnt/storage/appdata/shopping-list/shopping_list.sqlite`), decisión consciente
-de Victor. Protege de borrados/corrupción accidental del fichero o de un `podman rm` mal dado,
-pero **no** de un fallo del propio disco `sda` -- si se quiere esa protección más adelante, el
-destino tendría que ser `/mnt/media` (disco `sdb`, físicamente distinto) o algo fuera del
-servidor.
+Runs via cron, not inside a container — it's a standalone script with no new dependencies
+(`sqlite3` is part of the Python standard library).
 
-## Despliegue
+## Deploying
 
 ```bash
-# Copiar el script al servidor (mismo patrón que el resto del repo, junto a shopping-list-stack)
-scp backup.py homeserver:~/shopping-list-stack/backup/
+# Copy the script to wherever the app runs
+scp backup.py your-server:/path/to/backup/
 
-# Crontab de vdiaz -- una vez al día a las 03:00 (hora del servidor), fuera de horas de uso
+# Crontab — once a day at 03:00, off-peak
 crontab -e
-# Añadir:
-0 3 * * * /usr/bin/python3 /home/vdiaz/shopping-list-stack/backup/backup.py /mnt/storage/appdata/shopping-list/shopping_list.sqlite /mnt/storage/backups/shopping-list >> /home/vdiaz/shopping-list-stack/backup/backup.log 2>&1
+# Add:
+0 3 * * * /usr/bin/python3 /path/to/backup/backup.py /path/to/shopping_list.sqlite /path/to/backups >> /path/to/backup/backup.log 2>&1
 ```
 
-## Restaurar un backup
+Usage: `python3 backup.py <source_db> <backup_dir> [retention_days]` (default retention: 14
+days).
+
+## Restoring a backup
 
 ```bash
-# Parar el contenedor para que no escriba mientras se restaura
+# Stop the container so it doesn't write while restoring
 podman stop shopping-list
 
-# Copiar el backup elegido encima del fichero real (revisa antes la fecha en el nombre)
-cp /mnt/storage/backups/shopping-list/shopping_list-YYYY-MM-DD.sqlite \
-   /mnt/storage/appdata/shopping-list/shopping_list.sqlite
+# Copy the chosen backup over the real file (check the date in the filename first)
+cp /path/to/backups/shopping_list-YYYY-MM-DD.sqlite /path/to/shopping_list.sqlite
 
 podman start shopping-list
 ```
+
+**Note on disk placement**: for real protection against a disk failure (not just accidental
+deletion/corruption of the live file), the backup destination should be a *different physical
+disk* than the source database — a same-disk backup only protects against the latter.
