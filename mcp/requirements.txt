@@ -1,0 +1,8 @@
+# SDK oficial de Model Context Protocol (FastMCP + transporte Streamable HTTP).
+# Se fija <2 a propósito: mcp 2.x renombró FastMCP a MCPServer y cambió otras
+# APIs; esta app depende de la clase FastMCP tal cual existe en la serie 1.x.
+mcp>=1.30.0,<2
+
+# Servidor ASGI usado para levantar la app manualmente (envuelta en el
+# middleware de autenticación) en 0.0.0.0:8000.
+uvicorn>=0.31.1

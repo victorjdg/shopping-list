@@ -1,0 +1,10 @@
+secrets/*.env
+!secrets/*.env.example
+
+__pycache__/
+*.pyc
+
+# Ficheros SQLite locales (dev/tests) -- en produccion vive en el volumen appdata del
+# contenedor, fuera del repo.
+*.sqlite
+*.sqlite3
