@@ -251,9 +251,35 @@ tras confirmar con Victor. Las 6 filas correctas del ticket real de Lidl se qued
       15-16, Pizza Salami Premium/Sobrasada Miel a precio sin descontar) se dejaron tal cual a
       petición explícita de Victor, como ejemplo real de esta limitación conocida.
 
-## Fase 5 — Despliegue y robustez
+## Fase 5 — Despliegue y robustez ✅ (2026-09-23)
 
-- [ ] Contenerizar el worker (Dockerfile + script de despliegue, `--restart=always`)
-- [ ] Backups del fichero SQLite (aunque sea una copia periódica simple)
-- [ ] Revisar manejo de errores/reintentos en cada activity
-- [ ] Documentar el proyecto (README)
+- [x] **Contenerizado el worker** — vive en `Server/podman/mistral-workflow/` (infraestructura
+      compartida: un único worker registra tanto `server-health-report` como
+      `shopping-receipt`, no tenía sentido duplicar el contenedor). `shopping_receipt.py` se
+      copió tal cual a `Server/podman/mistral-workflow/app/src/workflows/` — mismo patrón que
+      ya existía para `server_health.py`: cada repo mantiene su propia copia versionada del
+      fichero, el worker que los ejecuta es infra compartida. Desplegado como
+      `mistral-workflow-worker` (`--restart=always`, sin puertos publicados, `.env`
+      actualizado a `host.containers.internal:8000`/`:8001` para los dos MCP servers). Copia en
+      `~/mistral-workflow-stack` en el servidor, mismo patrón que el resto del repo.
+  - **Efecto colateral esperado y aceptado**: al arrancar el worker se registra también el
+    schedule nativo de `server-health-report` (`0 7 * * *` UTC, ya venía codificado) — a partir
+    de ahora se dispara solo cada día. Confirmado con Victor que la hora sigue sirviendo.
+    Verificado por API (`client.workflows.schedules.get_schedules_async()`): `paused: false`,
+    próxima ejecución 2026-09-24 07:00 UTC.
+- [x] **Backups del SQLite** — `backup/backup.py` (usa `sqlite3.Connection.backup()`, copia
+      consistente aunque el fichero esté en uso por el contenedor) + cron en `vdiaz`
+      (`0 3 * * *`) escribiendo a `/mnt/storage/backups/shopping-list/`, reteniendo 14 días.
+      **Mismo disco físico que la DB origen** (`sda`) — decisión consciente de Victor: protege
+      de borrado/corrupción de fichero, no de un fallo del disco entero. Ver
+      `backup/README.md` para restaurar. Primer backup real verificado en vivo.
+- [x] **Revisado el manejo de reintentos** — `execute_mcp_tool` (usado por `update_price`/
+      `remove_item` en `shopping_receipt.py`) hereda la política de reintentos por defecto del
+      worker (3 intentos). Esas dos llamadas NO son idempotentes: `update_price` añade una fila
+      nueva al histórico en cada llamada, así que un timeout justo después de escribir pero
+      antes de que la respuesta llegue duplicaría la fila en un reintento. **Decisión de
+      Victor: dejar los 3 reintentos por defecto** — el riesgo es bajo (ventana de tiempo muy
+      corta) y, tras el hallazgo de la Fase 4, estas llamadas casi no se usan en la práctica
+      (Le Chat procesa el ticket con su propia visión, sin pasar por el Workflow). Las
+      activities de `server_health.py` son de solo lectura, sin este riesgo.
+- [x] **README del proyecto** — `README.md` en la raíz del repo.
